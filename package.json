@@ -1,0 +1,11 @@
+{
+  "name": "coqui-tts-api",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node services/coqui-tts-api/server.mjs"
+  }
+}
