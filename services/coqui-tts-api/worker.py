@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import argparse
-import base64
 import contextlib
-import io
 import json
 import os
 import sys
+import tempfile
 import traceback
 import wave
 
@@ -83,23 +82,31 @@ def load_tts_model():
     return tts, model_name, device, language
 
 
-def audio_to_wav_bytes(audio_data: list[float] | np.ndarray, sample_rate: int) -> bytes:
+def audio_to_wav_file(audio_data: list[float] | np.ndarray, sample_rate: int) -> tuple[str, int]:
     audio_array = np.asarray(audio_data, dtype=np.float32)
     if audio_array.ndim > 1:
         audio_array = np.squeeze(audio_array)
     audio_array = np.clip(audio_array, -1.0, 1.0)
     pcm_data = (audio_array * 32767.0).astype(np.int16)
 
-    with io.BytesIO() as wav_buffer:
-        with wave.open(wav_buffer, "wb") as wav_file:
+    temp_fd, wav_path = tempfile.mkstemp(prefix="coqui-tts-", suffix=".wav")
+    os.close(temp_fd)
+
+    try:
+        with wave.open(wav_path, "wb") as wav_file:
             wav_file.setnchannels(1)
             wav_file.setsampwidth(2)
             wav_file.setframerate(sample_rate)
             wav_file.writeframes(pcm_data.tobytes())
-        return wav_buffer.getvalue()
+    except Exception:
+        with contextlib.suppress(OSError):
+            os.remove(wav_path)
+        raise
+
+    return wav_path, os.path.getsize(wav_path)
 
 
-def synthesize(tts, *, text: str, language: str | None) -> tuple[bytes, int]:
+def synthesize(tts, *, text: str, language: str | None) -> tuple[str, int, int]:
     synthesis_kwargs = {"text": text}
     if language:
         synthesis_kwargs["language"] = language
@@ -108,7 +115,8 @@ def synthesize(tts, *, text: str, language: str | None) -> tuple[bytes, int]:
         audio = tts.tts(**synthesis_kwargs)
 
     sample_rate = getattr(getattr(tts, "synthesizer", None), "output_sample_rate", 22050)
-    return audio_to_wav_bytes(audio, sample_rate), int(sample_rate)
+    wav_path, wav_size = audio_to_wav_file(audio, sample_rate)
+    return wav_path, int(sample_rate), wav_size
 
 
 def handle_requests(tts, *, model_name: str, device: str, language: str | None) -> int:
@@ -137,7 +145,7 @@ def handle_requests(tts, *, model_name: str, device: str, language: str | None) 
             continue
 
         try:
-            wav_bytes, sample_rate = synthesize(tts, text=text.strip(), language=language)
+            wav_path, sample_rate, wav_size = synthesize(tts, text=text.strip(), language=language)
         except Exception as exc:  # pragma: no cover - runtime worker path
             traceback.print_exc(file=sys.stderr)
             emit({"id": request_id, "ok": False, "error": str(exc)})
@@ -149,7 +157,8 @@ def handle_requests(tts, *, model_name: str, device: str, language: str | None) 
                 "ok": True,
                 "content_type": "audio/wav",
                 "sample_rate": sample_rate,
-                "audio_base64": base64.b64encode(wav_bytes).decode("ascii"),
+                "audio_path": wav_path,
+                "audio_size": wav_size,
             }
         )
 
