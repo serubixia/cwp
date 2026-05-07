@@ -8,6 +8,75 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const DEFAULT_BODY_LIMIT_BYTES = Number.parseInt(process.env.BODY_LIMIT_BYTES || "65536", 10);
 const DEFAULT_HOST = process.env.HOST || "0.0.0.0";
 const DEFAULT_PORT = Number.parseInt(process.env.PORT || "3000", 10);
+const DEFAULT_MAX_CONCURRENT_SYNTHESIS = 1;
+
+function normalizePositiveInteger(value, fallback) {
+  const normalized = Number.parseInt(String(value ?? ""), 10);
+  if (!Number.isFinite(normalized) || normalized < 1) {
+    return fallback;
+  }
+  return normalized;
+}
+
+function createConcurrencyLimiter(maxConcurrent) {
+  let activeCount = 0;
+  const waitQueue = [];
+
+  async function acquire() {
+    if (activeCount < maxConcurrent) {
+      activeCount += 1;
+      return;
+    }
+
+    await new Promise((resolve) => {
+      waitQueue.push(resolve);
+    });
+    activeCount += 1;
+  }
+
+  function release() {
+    activeCount = Math.max(activeCount - 1, 0);
+    const next = waitQueue.shift();
+    if (next) {
+      next();
+    }
+  }
+
+  return {
+    async run(task) {
+      await acquire();
+      try {
+        return await task();
+      } finally {
+        release();
+      }
+    },
+  };
+}
+
+function resolveWorkerRuntimeConfig(options = {}) {
+  const serviceDir = path.dirname(fileURLToPath(import.meta.url));
+  const workerScript = options.workerScript || path.join(serviceDir, "worker.py");
+  const pythonExecutable = options.pythonExecutable || process.env.PYTHON_EXECUTABLE || "python3";
+  const workerEnv = {
+    ...process.env,
+    COQUI_MODEL: process.env.COQUI_MODEL || "tts_models/es/css10/vits",
+    COQUI_LANGUAGE: process.env.COQUI_LANGUAGE || "es",
+    COQUI_DEVICE: process.env.COQUI_DEVICE || "cpu",
+    PYTHONUNBUFFERED: "1",
+  };
+
+  return {
+    serviceDir,
+    workerScript,
+    pythonExecutable,
+    workerEnv,
+    readyState: {
+      model: workerEnv.COQUI_MODEL,
+      device: workerEnv.COQUI_DEVICE,
+    },
+  };
+}
 
 function sendJson(response, statusCode, payload) {
   response.writeHead(statusCode, { "content-type": "application/json; charset=utf-8" });
@@ -44,16 +113,7 @@ async function readJsonBody(request, limitBytes) {
 }
 
 function createWorkerClient(options = {}) {
-  const serviceDir = path.dirname(fileURLToPath(import.meta.url));
-  const workerScript = options.workerScript || path.join(serviceDir, "worker.py");
-  const pythonExecutable = options.pythonExecutable || process.env.PYTHON_EXECUTABLE || "python3";
-  const workerEnv = {
-    ...process.env,
-    COQUI_MODEL: process.env.COQUI_MODEL || "tts_models/es/css10/vits",
-    COQUI_LANGUAGE: process.env.COQUI_LANGUAGE || "es",
-    COQUI_DEVICE: process.env.COQUI_DEVICE || "cpu",
-    PYTHONUNBUFFERED: "1",
-  };
+  const { serviceDir, workerScript, pythonExecutable, workerEnv } = resolveWorkerRuntimeConfig(options);
 
   const worker = spawn(pythonExecutable, [workerScript], {
     cwd: path.resolve(serviceDir, "..", ".."),
@@ -157,9 +217,29 @@ function createWorkerClient(options = {}) {
     },
     async close() {
       outputReader.close();
-      worker.kill("SIGTERM");
+
+      if (worker.exitCode !== null || worker.signalCode !== null) {
+        return;
+      }
+
+      await new Promise((resolve) => {
+        worker.once("exit", () => resolve());
+        worker.kill("SIGTERM");
+      });
     },
   };
+}
+
+async function synthesizeWithEphemeralWorker(text, options = {}) {
+  const workerClient = createWorkerClient(options);
+
+  try {
+    const readyState = await workerClient.ready;
+    const synthesis = await workerClient.synthesize(text);
+    return { readyState, synthesis };
+  } finally {
+    await workerClient.close().catch(() => {});
+  }
 }
 
 export async function startServer(options = {}) {
@@ -167,9 +247,12 @@ export async function startServer(options = {}) {
   const port = options.port || DEFAULT_PORT;
   const textLimit = options.textLimit || Number.parseInt(process.env.MAX_TEXT_LENGTH || "5000", 10);
   const bodyLimitBytes = options.bodyLimitBytes || DEFAULT_BODY_LIMIT_BYTES;
-
-  const workerClient = createWorkerClient(options);
-  const readyState = await workerClient.ready;
+  const maxConcurrentSynthesis = normalizePositiveInteger(
+    options.maxConcurrentSynthesis ?? process.env.COQUI_MAX_CONCURRENT_SYNTHESIS,
+    DEFAULT_MAX_CONCURRENT_SYNTHESIS,
+  );
+  const readyState = resolveWorkerRuntimeConfig(options).readyState;
+  const synthesisLimiter = createConcurrencyLimiter(maxConcurrentSynthesis);
 
   const server = http.createServer(async (request, response) => {
     try {
@@ -200,13 +283,15 @@ export async function startServer(options = {}) {
         return;
       }
 
-      const synthesis = await workerClient.synthesize(text);
+      const { readyState: requestReadyState, synthesis } = await synthesisLimiter.run(
+        () => synthesizeWithEphemeralWorker(text, options),
+      );
       const audioBuffer = Buffer.from(synthesis.audio_base64, "base64");
 
       response.writeHead(200, {
         "content-type": synthesis.content_type || "audio/wav",
         "content-length": String(audioBuffer.length),
-        "x-coqui-model": readyState.model,
+        "x-coqui-model": requestReadyState.model,
         "x-sample-rate": String(synthesis.sample_rate || ""),
       });
       response.end(audioBuffer);
@@ -217,7 +302,6 @@ export async function startServer(options = {}) {
   });
 
   const closeServer = async () => {
-    await workerClient.close();
     await new Promise((resolve, reject) => {
       server.close((error) => {
         if (error) {
