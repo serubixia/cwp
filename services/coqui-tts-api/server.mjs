@@ -1,8 +1,11 @@
 import http from "node:http";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { createReadStream } from "node:fs";
+import { rm, stat } from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline";
+import { pipeline } from "node:stream/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const DEFAULT_BODY_LIMIT_BYTES = Number.parseInt(process.env.BODY_LIMIT_BYTES || "65536", 10);
@@ -81,6 +84,33 @@ function resolveWorkerRuntimeConfig(options = {}) {
 function sendJson(response, statusCode, payload) {
   response.writeHead(statusCode, { "content-type": "application/json; charset=utf-8" });
   response.end(JSON.stringify(payload));
+}
+
+async function respondWithAudioFile(response, synthesis, readyState) {
+  const audioPath = typeof synthesis.audio_path === "string" ? synthesis.audio_path : "";
+  if (!audioPath) {
+    throw new Error("Worker response did not include `audio_path`.");
+  }
+
+  const fileStats = await stat(audioPath);
+  const audioSize = Number.isFinite(synthesis.audio_size) ? synthesis.audio_size : fileStats.size;
+  const audioStream = createReadStream(audioPath);
+
+  await new Promise((resolve, reject) => {
+    audioStream.once("open", resolve);
+    audioStream.once("error", reject);
+  });
+
+  await rm(audioPath, { force: true }).catch(() => {});
+
+  response.writeHead(200, {
+    "content-type": synthesis.content_type || "audio/wav",
+    "content-length": String(audioSize),
+    "x-coqui-model": readyState.model,
+    "x-sample-rate": String(synthesis.sample_rate || ""),
+  });
+
+  await pipeline(audioStream, response);
 }
 
 async function readJsonBody(request, limitBytes) {
@@ -286,17 +316,13 @@ export async function startServer(options = {}) {
       const { readyState: requestReadyState, synthesis } = await synthesisLimiter.run(
         () => synthesizeWithEphemeralWorker(text, options),
       );
-      const audioBuffer = Buffer.from(synthesis.audio_base64, "base64");
-
-      response.writeHead(200, {
-        "content-type": synthesis.content_type || "audio/wav",
-        "content-length": String(audioBuffer.length),
-        "x-coqui-model": requestReadyState.model,
-        "x-sample-rate": String(synthesis.sample_rate || ""),
-      });
-      response.end(audioBuffer);
+      await respondWithAudioFile(response, synthesis, requestReadyState);
     } catch (error) {
       const statusCode = error.statusCode || 500;
+      if (response.headersSent) {
+        response.destroy(error);
+        return;
+      }
       sendJson(response, statusCode, { error: error.message || "Unexpected server error." });
     }
   });
