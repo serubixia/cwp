@@ -6,6 +6,7 @@ ENV NODE_ENV=production \
     COQUI_MODEL=tts_models/es/css10/vits \
     COQUI_LANGUAGE=es \
     COQUI_DEVICE=cpu \
+    COQUI_MAX_CONCURRENT_SYNTHESIS=1 \
     PYTHONUNBUFFERED=1
 
 RUN apt-get update \
