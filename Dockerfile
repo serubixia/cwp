@@ -3,6 +3,7 @@ FROM node:22-bookworm-slim
 ENV NODE_ENV=production \
     PIP_NO_CACHE_DIR=1 \
     PORT=3000 \
+    LOG_LEVEL=info \
     COQUI_MODEL=tts_models/es/css10/vits \
     COQUI_LANGUAGE=es \
     COQUI_DEVICE=cpu \
@@ -21,12 +22,12 @@ RUN apt-get update \
 WORKDIR /app
 
 COPY package.json ./
-COPY services/coqui-tts-api ./services/coqui-tts-api
+COPY src ./src
 
 RUN python3 -m venv /opt/coqui-venv \
     && /opt/coqui-venv/bin/python -m pip install --upgrade pip setuptools wheel \
     && /opt/coqui-venv/bin/python -m pip install TTS==0.22.0 \
-    && PYTHON_EXECUTABLE=/opt/coqui-venv/bin/python COQUI_DEVICE=cpu /opt/coqui-venv/bin/python services/coqui-tts-api/worker.py --preload-only
+    && PYTHON_EXECUTABLE=/opt/coqui-venv/bin/python COQUI_DEVICE=cpu /opt/coqui-venv/bin/python src/worker.py --preload-only
 
 ENV PYTHON_EXECUTABLE=/opt/coqui-venv/bin/python
 
