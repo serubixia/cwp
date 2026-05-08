@@ -14,8 +14,10 @@ import {
 export const DEFAULT_BODY_LIMIT_BYTES = 64 * 1024;
 export const DEFAULT_MAX_TEXT_LENGTH = 5000;
 export const DEFAULT_MAX_CONCURRENT_SYNTHESIS = 1;
+export const DEFAULT_SYNTHESIS_TIMEOUT_MS = 120 * 1000;
 const DEFAULT_AUDIO_CONTENT_TYPE = 'audio/wav';
 const DEFAULT_AUDIO_FILENAME = 'tts.wav';
+const WORKER_SHUTDOWN_GRACE_MS = 2000;
 
 export function normalizePositiveInteger(value, fallback, label = 'value') {
   const normalizedValue = Number.parseInt(String(value ?? ''), 10);
@@ -46,6 +48,50 @@ function formatStderrChunk(chunk) {
   }
 
   return message.length > 1200 ? `...${message.slice(-1197)}` : message;
+}
+
+function normalizeAbortReason(reason, fallbackMessage = 'The operation was aborted.') {
+  if (reason instanceof Error) {
+    return reason;
+  }
+
+  const error = new Error(
+    typeof reason === 'string' && reason.trim().length > 0
+      ? reason.trim()
+      : fallbackMessage
+  );
+  error.name = 'AbortError';
+  error.code = 'ABORT_ERR';
+  return error;
+}
+
+async function waitForAbortable(promise, signal) {
+  if (!signal) {
+    return promise;
+  }
+
+  if (signal.aborted) {
+    throw normalizeAbortReason(signal.reason);
+  }
+
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      reject(normalizeAbortReason(signal.reason));
+    };
+
+    signal.addEventListener('abort', onAbort, { once: true });
+
+    promise.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(error);
+      }
+    );
+  });
 }
 
 async function runCommand(binary, args) {
@@ -115,30 +161,86 @@ export function createConcurrencyLimiter(maxConcurrent) {
   let activeCount = 0;
   const waitQueue = [];
 
-  async function acquire() {
+  async function acquire(signal) {
+    if (signal?.aborted) {
+      throw normalizeAbortReason(signal.reason);
+    }
+
     if (activeCount < maxConcurrent) {
       activeCount += 1;
       return;
     }
 
-    await new Promise((resolve) => {
-      waitQueue.push(resolve);
+    await new Promise((resolve, reject) => {
+      const queueEntry = {
+        signal,
+        resolve: () => {
+          queueEntry.cleanup?.();
+          resolve();
+        },
+        abortReject: (error) => {
+          queueEntry.cleanup?.();
+          reject(error);
+        },
+        cleanup: null,
+      };
+
+      if (signal) {
+        const onAbort = () => {
+          const entryIndex = waitQueue.indexOf(queueEntry);
+          if (entryIndex !== -1) {
+            waitQueue.splice(entryIndex, 1);
+          }
+
+          queueEntry.abortReject(normalizeAbortReason(signal.reason));
+        };
+
+        queueEntry.cleanup = () => {
+          signal.removeEventListener('abort', onAbort);
+        };
+
+        signal.addEventListener('abort', onAbort, { once: true });
+      } else {
+        queueEntry.cleanup = () => {};
+      }
+
+      waitQueue.push(queueEntry);
     });
+
+    if (signal?.aborted) {
+      throw normalizeAbortReason(signal.reason);
+    }
+
     activeCount += 1;
   }
 
   function release() {
     activeCount = Math.max(activeCount - 1, 0);
-    const next = waitQueue.shift();
-    if (next) {
-      next();
+
+    while (waitQueue.length > 0) {
+      const next = waitQueue.shift();
+      if (!next) {
+        return;
+      }
+
+      if (next.signal?.aborted) {
+        next.cleanup?.();
+        continue;
+      }
+
+      next.resolve();
+      return;
     }
   }
 
   return {
-    async run(task) {
-      await acquire();
+    async run(task, { signal } = {}) {
+      await acquire(signal);
       try {
+        if (signal?.aborted) {
+          throw normalizeAbortReason(signal.reason);
+        }
+
         return await task();
       } finally {
         release();
@@ -332,7 +434,21 @@ function createWorkerClient(options = {}) {
       }
 
       await new Promise((resolve) => {
-        worker.once('exit', () => resolve());
+        const forceKillTimer = setTimeout(() => {
+          if (worker.exitCode === null && worker.signalCode === null) {
+            logError('worker.process.force_killed', {
+              worker_script: runtimeConfig.worker_script,
+            });
+            worker.kill('SIGKILL');
+          }
+        }, WORKER_SHUTDOWN_GRACE_MS);
+        forceKillTimer.unref?.();
+
+        worker.once('exit', () => {
+          clearTimeout(forceKillTimer);
+          resolve();
+        });
+
         worker.kill('SIGTERM');
       });
     },
@@ -361,11 +477,17 @@ export async function getHealthStatus(options = {}) {
 }
 
 export async function synthesizeSpeech(requestBody, options = {}) {
+  const signal = options.signal;
   const textLimit = normalizePositiveInteger(
     options.textLimit ?? process.env.MAX_TEXT_LENGTH,
     DEFAULT_MAX_TEXT_LENGTH,
     'text_limit'
   );
+
+  if (signal?.aborted) {
+    throw normalizeAbortReason(signal.reason, 'Speech synthesis was aborted before it started.');
+  }
+
   const { text } = normalizeSynthesizeRequest(requestBody, { textLimit });
   const synthesisStartedAt = Date.now();
 
@@ -373,11 +495,17 @@ export async function synthesizeSpeech(requestBody, options = {}) {
     text_length: text.length,
   });
 
-  const workerClient = createWorkerClient(options);
+  const workerClientFactory = options.workerClientFactory || createWorkerClient;
+  const workerClient = workerClientFactory(options);
 
   try {
-    const readyState = await workerClient.ready;
-    const synthesis = await workerClient.synthesize(text);
+    const readyState = await waitForAbortable(workerClient.ready, signal);
+
+    if (signal?.aborted) {
+      throw normalizeAbortReason(signal.reason);
+    }
+
+    const synthesis = await waitForAbortable(workerClient.synthesize(text), signal);
     const audioPath = ensureNonEmptyString(synthesis.audio_path, 'audio_path');
     const fileStats = await stat(audioPath);
     const audioSize = Number.isFinite(synthesis.audio_size)
@@ -410,11 +538,18 @@ export async function synthesizeSpeech(requestBody, options = {}) {
       },
     };
   } catch (error) {
-    logError('audio.synthesize.failed', {
+    const logPayload = {
       duration_ms: Date.now() - synthesisStartedAt,
       text_length: text.length,
       error: error.message,
-    });
+    };
+
+    if (error.name === 'AbortError' || error.name === 'TimeoutError') {
+      logInfo('audio.synthesize.cancelled', logPayload);
+    } else {
+      logError('audio.synthesize.failed', logPayload);
+    }
+
     throw error;
   } finally {
     await workerClient.close().catch(() => {});
