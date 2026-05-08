@@ -9,6 +9,7 @@ import {
   DEFAULT_BODY_LIMIT_BYTES,
   DEFAULT_MAX_CONCURRENT_SYNTHESIS,
   DEFAULT_MAX_TEXT_LENGTH,
+  DEFAULT_SYNTHESIS_TIMEOUT_MS,
   createConcurrencyLimiter,
   getHealthStatus,
   normalizePositiveInteger,
@@ -22,6 +23,79 @@ import {
 
 const DEFAULT_HOST = process.env.HOST || '0.0.0.0';
 const DEFAULT_PORT = Number(process.env.PORT || 3000);
+
+function createHttpError(message, { name = 'Error', code, statusCode } = {}) {
+  const error = new Error(message);
+  error.name = name;
+
+  if (code) {
+    error.code = code;
+  }
+
+  if (statusCode) {
+    error.statusCode = statusCode;
+  }
+
+  return error;
+}
+
+function createSynthesisSignal({ request, response, timeoutMs }) {
+  const controller = new AbortController();
+  let responseFinished = false;
+
+  const abortWith = (error) => {
+    if (!controller.signal.aborted) {
+      controller.abort(error);
+    }
+  };
+
+  const onRequestAborted = () => {
+    if (!responseFinished) {
+      abortWith(createHttpError(
+        'The client closed the connection before the synthesis completed.',
+        { name: 'AbortError', code: 'REQUEST_ABORTED', statusCode: 499 }
+      ));
+    }
+  };
+
+  const onResponseFinished = () => {
+    responseFinished = true;
+  };
+
+  const onResponseClosed = () => {
+    if (!responseFinished) {
+      abortWith(createHttpError(
+        'The client closed the response before the synthesis completed.',
+        { name: 'AbortError', code: 'RESPONSE_CLOSED', statusCode: 499 }
+      ));
+    }
+  };
+
+  const timeoutId = setTimeout(() => {
+    abortWith(createHttpError(
+      `Speech synthesis timed out after ${timeoutMs} ms.`,
+      { name: 'TimeoutError', code: 'SYNTHESIS_TIMEOUT', statusCode: 504 }
+    ));
+  }, timeoutMs);
+  timeoutId.unref?.();
+
+  const cleanup = () => {
+    clearTimeout(timeoutId);
+    request.removeListener('aborted', onRequestAborted);
+    response.removeListener('finish', onResponseFinished);
+    response.removeListener('close', onResponseClosed);
+  };
+
+  request.on('aborted', onRequestAborted);
+  response.on('finish', onResponseFinished);
+  response.on('close', onResponseClosed);
+  controller.signal.addEventListener('abort', cleanup, { once: true });
+
+  return {
+    signal: controller.signal,
+    cleanup,
+  };
+}
 
 function sendJson(response, statusCode, payload, extraHeaders = {}) {
   response.writeHead(statusCode, {
@@ -136,6 +210,7 @@ export function createServer({
   healthStatusHandler = getHealthStatus,
   bodyLimitBytes,
   textLimit,
+  synthesisTimeoutMs,
   maxConcurrentSynthesis,
   synthesisLimiter,
   ...serviceOptions
@@ -149,6 +224,11 @@ export function createServer({
     textLimit ?? process.env.MAX_TEXT_LENGTH,
     DEFAULT_MAX_TEXT_LENGTH,
     'text_limit'
+  );
+  const normalizedSynthesisTimeoutMs = normalizePositiveInteger(
+    synthesisTimeoutMs ?? process.env.COQUI_SYNTHESIS_TIMEOUT_MS,
+    DEFAULT_SYNTHESIS_TIMEOUT_MS,
+    'synthesis_timeout_ms'
   );
   const normalizedMaxConcurrentSynthesis = normalizePositiveInteger(
     maxConcurrentSynthesis ?? process.env.COQUI_MAX_CONCURRENT_SYNTHESIS,
@@ -197,18 +277,31 @@ export function createServer({
         }
 
         if (request.method === 'POST' && (url.pathname === '/v1/audio/synthesize' || url.pathname === '/tts')) {
-          const payload = await readJsonBody(request, normalizedBodyLimitBytes);
-          logInfo('http.request.parsed', {
-            operation: 'synthesize',
-            payload: summarizeSynthesizePayload(payload),
+          const synthesisContext = createSynthesisSignal({
+            request,
+            response,
+            timeoutMs: normalizedSynthesisTimeoutMs,
           });
 
-          const result = await effectiveSynthesisLimiter.run(() => synthesizeSpeechHandler(payload, {
-            textLimit: normalizedTextLimit,
-            ...serviceOptions,
-          }));
-          await sendSynthesisResult(response, result);
-          return;
+          try {
+            const payload = await readJsonBody(request, normalizedBodyLimitBytes);
+            logInfo('http.request.parsed', {
+              operation: 'synthesize',
+              payload: summarizeSynthesizePayload(payload),
+            });
+
+            const result = await effectiveSynthesisLimiter.run(() => synthesizeSpeechHandler(payload, {
+              textLimit: normalizedTextLimit,
+              signal: synthesisContext.signal,
+              ...serviceOptions,
+            }), {
+              signal: synthesisContext.signal,
+            });
+            await sendSynthesisResult(response, result);
+            return;
+          } finally {
+            synthesisContext.cleanup();
+          }
         }
 
         sendJson(response, 404, {
@@ -228,6 +321,10 @@ export function createServer({
 
         if (response.headersSent) {
           response.destroy(error);
+          return;
+        }
+
+        if (response.destroyed || request.aborted) {
           return;
         }
 
