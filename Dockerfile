@@ -29,7 +29,7 @@ COPY audio ./audio
 
 RUN python3 -m venv /opt/coqui-venv \
     && /opt/coqui-venv/bin/python -m pip install --upgrade pip setuptools wheel \
-    && /opt/coqui-venv/bin/python -m pip install TTS==0.22.0 \
+    && /opt/coqui-venv/bin/python -m pip install TTS==0.22.0 transformers==4.46.1 torchcodec \
     && PYTHON_EXECUTABLE=/opt/coqui-venv/bin/python COQUI_DEVICE=cpu /opt/coqui-venv/bin/python src/worker.py --preload-only
 
 ENV PYTHON_EXECUTABLE=/opt/coqui-venv/bin/python
