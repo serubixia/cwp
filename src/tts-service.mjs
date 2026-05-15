@@ -18,6 +18,8 @@ export const DEFAULT_SYNTHESIS_TIMEOUT_MS = 120 * 1000;
 const DEFAULT_AUDIO_CONTENT_TYPE = 'audio/wav';
 const DEFAULT_AUDIO_FILENAME = 'tts.wav';
 const WORKER_SHUTDOWN_GRACE_MS = 2000;
+const DEFAULT_SPEAKER_AUDIO_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'audio');
+const SPEAKER_WAV_PATH_SEPARATOR_PATTERN = /[\\/]/;
 
 export function normalizePositiveInteger(value, fallback, label = 'value') {
   const normalizedValue = Number.parseInt(String(value ?? ''), 10);
@@ -52,6 +54,35 @@ function normalizeOptionalString(value) {
 
   const normalized = value.trim();
   return normalized.length > 0 ? normalized : undefined;
+}
+
+function resolveAudioDir(audioDir) {
+  if (audioDir == null) {
+    return DEFAULT_SPEAKER_AUDIO_DIR;
+  }
+
+  if (typeof audioDir !== 'string' || audioDir.trim().length === 0) {
+    throw new Error('audioDir must be a non-empty string.');
+  }
+
+  return path.resolve(audioDir.trim());
+}
+
+function resolveSpeakerWavPath(value, { audioDir } = {}) {
+  const speakerWav = normalizeOptionalString(value);
+  if (!speakerWav) {
+    return undefined;
+  }
+
+  if (path.isAbsolute(speakerWav) || SPEAKER_WAV_PATH_SEPARATOR_PATTERN.test(speakerWav)) {
+    return speakerWav;
+  }
+
+  const resolvedSpeakerName = path.extname(speakerWav).length > 0
+    ? speakerWav
+    : `${speakerWav}.wav`;
+
+  return path.join(resolveAudioDir(audioDir), resolvedSpeakerName);
 }
 
 function formatStderrChunk(chunk) {
@@ -266,7 +297,8 @@ export function resolveWorkerRuntimeConfig(options = {}) {
   const srcDir = path.dirname(fileURLToPath(import.meta.url));
   const workerScript = path.resolve(options.workerScript || path.join(srcDir, 'worker.py'));
   const pythonExecutable = options.pythonExecutable || process.env.PYTHON_EXECUTABLE || 'python3';
-  const speakerWav = normalizeOptionalString(options.speakerWav ?? process.env.COQUI_SPEAKER_WAV);
+  const audioDir = resolveAudioDir(options.audioDir);
+  const speakerWav = resolveSpeakerWavPath(options.speakerWav ?? process.env.COQUI_SPEAKER_WAV, { audioDir });
   const workerEnv = {
     ...process.env,
     COQUI_MODEL: process.env.COQUI_MODEL || 'tts_models/es/css10/vits',
@@ -281,6 +313,7 @@ export function resolveWorkerRuntimeConfig(options = {}) {
 
   return {
     src_dir: srcDir,
+    audio_dir: audioDir,
     worker_script: workerScript,
     python_executable: pythonExecutable,
     worker_env: workerEnv,
@@ -295,14 +328,14 @@ export function resolveWorkerRuntimeConfig(options = {}) {
   };
 }
 
-export function normalizeSynthesizeRequest(requestBody, { textLimit = DEFAULT_MAX_TEXT_LENGTH } = {}) {
+export function normalizeSynthesizeRequest(requestBody, { textLimit = DEFAULT_MAX_TEXT_LENGTH, audioDir } = {}) {
   if (!requestBody || typeof requestBody !== 'object') {
     throw new Error('The request body must be an object.');
   }
 
   const text = ensureNonEmptyString(requestBody.text, 'text');
   const speakerWav = Object.hasOwn(requestBody, 'speaker_wav')
-    ? ensureNonEmptyString(requestBody.speaker_wav, 'speaker_wav')
+    ? resolveSpeakerWavPath(ensureNonEmptyString(requestBody.speaker_wav, 'speaker_wav'), { audioDir })
     : undefined;
 
   if (text.length > textLimit) {
@@ -437,7 +470,7 @@ function createWorkerClient(options = {}) {
         ? ensureNonEmptyString(request, 'text')
         : ensureNonEmptyString(request?.text, 'text');
       const speakerWav = request && typeof request === 'object' && Object.hasOwn(request, 'speaker_wav')
-        ? ensureNonEmptyString(request.speaker_wav, 'speaker_wav')
+        ? resolveSpeakerWavPath(ensureNonEmptyString(request.speaker_wav, 'speaker_wav'), { audioDir: runtimeConfig.audio_dir })
         : undefined;
       const id = randomUUID();
       const payload = JSON.stringify({
@@ -522,7 +555,10 @@ export async function synthesizeSpeech(requestBody, options = {}) {
     throw normalizeAbortReason(signal.reason, 'Speech synthesis was aborted before it started.');
   }
 
-  const request = normalizeSynthesizeRequest(requestBody, { textLimit });
+  const request = normalizeSynthesizeRequest(requestBody, {
+    textLimit,
+    audioDir: options.audioDir,
+  });
   const { text } = request;
   const synthesisStartedAt = Date.now();
 
