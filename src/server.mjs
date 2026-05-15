@@ -125,6 +125,7 @@ function getContentType(request) {
 function summarizeSynthesizePayload(payload) {
   return {
     text_length: typeof payload?.text === 'string' ? payload.text.trim().length : undefined,
+    has_speaker_wav: typeof payload?.speaker_wav === 'string' && payload.speaker_wav.trim().length > 0,
   };
 }
 
