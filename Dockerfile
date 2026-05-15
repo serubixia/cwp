@@ -14,6 +14,7 @@ ENV NODE_ENV=production \
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
+        libpython3.11 \
         python3 \
         python3-pip \
         python3-venv \
