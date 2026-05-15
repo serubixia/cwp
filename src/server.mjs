@@ -6,6 +6,7 @@ import { pipeline } from 'node:stream/promises';
 import { fileURLToPath } from 'node:url';
 
 import {
+  closeSharedWorkers,
   DEFAULT_BODY_LIMIT_BYTES,
   DEFAULT_MAX_CONCURRENT_SYNTHESIS,
   DEFAULT_MAX_TEXT_LENGTH,
@@ -14,6 +15,7 @@ import {
   getHealthStatus,
   normalizePositiveInteger,
   synthesizeSpeech,
+  warmSharedWorker,
 } from './tts-service.mjs';
 import {
   logError,
@@ -341,9 +343,24 @@ export function createServer({
 export async function startServer(options = {}) {
   const host = options.host || DEFAULT_HOST;
   const port = options.port || DEFAULT_PORT;
+  const preloadWorkerOnStart = options.preloadWorkerOnStart ?? options.synthesizeSpeechHandler == null;
+
+  if (preloadWorkerOnStart) {
+    logInfo('worker.preload.started', {
+      model: process.env.COQUI_MODEL,
+      device: process.env.COQUI_DEVICE,
+    });
+    await warmSharedWorker(options);
+    logInfo('worker.preload.completed', {
+      model: process.env.COQUI_MODEL,
+      device: process.env.COQUI_DEVICE,
+    });
+  }
+
   const server = createServer(options);
 
   const closeServer = async () => {
+    await closeSharedWorkers(options);
     await new Promise((resolve, reject) => {
       server.close((error) => {
         if (error) {
