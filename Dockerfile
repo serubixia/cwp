@@ -18,7 +18,6 @@ RUN apt-get update \
         python3-pip \
         python3-venv \
         espeak-ng \
-        ffmpeg \
         libsndfile1 \
     && rm -rf /var/lib/apt/lists/*
 
@@ -28,8 +27,7 @@ COPY package.json ./
 COPY src ./src
 COPY audio ./audio
 
-RUN ffmpeg -y -loglevel error -i /app/audio/Roberto.mp3 -ac 1 -ar 24000 /app/audio/Roberto.wav \
-    && python3 -m venv /opt/coqui-venv \
+RUN python3 -m venv /opt/coqui-venv \
     && /opt/coqui-venv/bin/python -m pip install --upgrade pip setuptools wheel \
     && /opt/coqui-venv/bin/python -m pip install TTS==0.22.0 \
     && PYTHON_EXECUTABLE=/opt/coqui-venv/bin/python COQUI_DEVICE=cpu /opt/coqui-venv/bin/python src/worker.py --preload-only
