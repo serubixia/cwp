@@ -4,10 +4,12 @@ ENV NODE_ENV=production \
     PIP_NO_CACHE_DIR=1 \
     PORT=3000 \
     LOG_LEVEL=info \
-    COQUI_MODEL=tts_models/es/css10/vits \
+    COQUI_MODEL=tts_models/multilingual/multi-dataset/xtts_v2 \
     COQUI_LANGUAGE=es \
     COQUI_DEVICE=cpu \
+    COQUI_SPEAKER_WAV=/app/audio/Roberto.wav \
     COQUI_MAX_CONCURRENT_SYNTHESIS=1 \
+    COQUI_TOS_AGREED=1 \
     PYTHONUNBUFFERED=1
 
 RUN apt-get update \
@@ -16,6 +18,7 @@ RUN apt-get update \
         python3-pip \
         python3-venv \
         espeak-ng \
+        ffmpeg \
         libsndfile1 \
     && rm -rf /var/lib/apt/lists/*
 
@@ -23,8 +26,10 @@ WORKDIR /app
 
 COPY package.json ./
 COPY src ./src
+COPY audio ./audio
 
-RUN python3 -m venv /opt/coqui-venv \
+RUN ffmpeg -y -loglevel error -i /app/audio/Roberto.mp3 -ac 1 -ar 24000 /app/audio/Roberto.wav \
+    && python3 -m venv /opt/coqui-venv \
     && /opt/coqui-venv/bin/python -m pip install --upgrade pip setuptools wheel \
     && /opt/coqui-venv/bin/python -m pip install TTS==0.22.0 \
     && PYTHON_EXECUTABLE=/opt/coqui-venv/bin/python COQUI_DEVICE=cpu /opt/coqui-venv/bin/python src/worker.py --preload-only
