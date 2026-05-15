@@ -41,6 +41,19 @@ function ensureNonEmptyString(value, label) {
   return value.trim();
 }
 
+function normalizeOptionalString(value) {
+  if (value == null) {
+    return undefined;
+  }
+
+  if (typeof value !== 'string') {
+    throw new Error('speaker_wav must be a non-empty string.');
+  }
+
+  const normalized = value.trim();
+  return normalized.length > 0 ? normalized : undefined;
+}
+
 function formatStderrChunk(chunk) {
   const message = String(chunk).trim();
   if (!message) {
@@ -253,6 +266,7 @@ export function resolveWorkerRuntimeConfig(options = {}) {
   const srcDir = path.dirname(fileURLToPath(import.meta.url));
   const workerScript = path.resolve(options.workerScript || path.join(srcDir, 'worker.py'));
   const pythonExecutable = options.pythonExecutable || process.env.PYTHON_EXECUTABLE || 'python3';
+  const speakerWav = normalizeOptionalString(options.speakerWav ?? process.env.COQUI_SPEAKER_WAV);
   const workerEnv = {
     ...process.env,
     COQUI_MODEL: process.env.COQUI_MODEL || 'tts_models/es/css10/vits',
@@ -260,6 +274,10 @@ export function resolveWorkerRuntimeConfig(options = {}) {
     COQUI_DEVICE: process.env.COQUI_DEVICE || 'cpu',
     PYTHONUNBUFFERED: '1',
   };
+
+  if (speakerWav) {
+    workerEnv.COQUI_SPEAKER_WAV = speakerWav;
+  }
 
   return {
     src_dir: srcDir,
@@ -270,6 +288,7 @@ export function resolveWorkerRuntimeConfig(options = {}) {
       model: workerEnv.COQUI_MODEL,
       language: workerEnv.COQUI_LANGUAGE,
       device: workerEnv.COQUI_DEVICE,
+      speaker_wav: speakerWav,
       python_executable: pythonExecutable,
       worker_script: workerScript,
     },
@@ -282,12 +301,15 @@ export function normalizeSynthesizeRequest(requestBody, { textLimit = DEFAULT_MA
   }
 
   const text = ensureNonEmptyString(requestBody.text, 'text');
+  const speakerWav = Object.hasOwn(requestBody, 'speaker_wav')
+    ? ensureNonEmptyString(requestBody.speaker_wav, 'speaker_wav')
+    : undefined;
 
   if (text.length > textLimit) {
     throw new Error(`Field \`text\` exceeds the maximum length of ${textLimit} characters.`);
   }
 
-  return { text };
+  return speakerWav ? { text, speaker_wav: speakerWav } : { text };
 }
 
 function createWorkerClient(options = {}) {
@@ -404,15 +426,26 @@ function createWorkerClient(options = {}) {
 
   return {
     ready,
-    async synthesize(text) {
+    async synthesize(request) {
       await ready;
 
       if (!worker.stdin.writable) {
         throw new Error('Coqui worker is not writable.');
       }
 
+      const text = typeof request === 'string'
+        ? ensureNonEmptyString(request, 'text')
+        : ensureNonEmptyString(request?.text, 'text');
+      const speakerWav = request && typeof request === 'object' && Object.hasOwn(request, 'speaker_wav')
+        ? ensureNonEmptyString(request.speaker_wav, 'speaker_wav')
+        : undefined;
       const id = randomUUID();
-      const payload = JSON.stringify({ action: 'synthesize', id, text });
+      const payload = JSON.stringify({
+        action: 'synthesize',
+        id,
+        text,
+        ...(speakerWav ? { speaker_wav: speakerWav } : {}),
+      });
 
       return new Promise((resolve, reject) => {
         pendingRequests.set(id, { resolve, reject });
@@ -470,6 +503,7 @@ export async function getHealthStatus(options = {}) {
     model: runtimeConfig.ready_state.model,
     language: runtimeConfig.ready_state.language,
     device: runtimeConfig.ready_state.device,
+    speaker_wav: runtimeConfig.ready_state.speaker_wav,
     python_executable: runtimeConfig.python_executable,
     python_version: versionOutput,
     worker_script: runtimeConfig.worker_script,
@@ -488,11 +522,13 @@ export async function synthesizeSpeech(requestBody, options = {}) {
     throw normalizeAbortReason(signal.reason, 'Speech synthesis was aborted before it started.');
   }
 
-  const { text } = normalizeSynthesizeRequest(requestBody, { textLimit });
+  const request = normalizeSynthesizeRequest(requestBody, { textLimit });
+  const { text } = request;
   const synthesisStartedAt = Date.now();
 
   logInfo('audio.synthesize.started', {
     text_length: text.length,
+    speaker_wav_override: Object.hasOwn(request, 'speaker_wav'),
   });
 
   const workerClientFactory = options.workerClientFactory || createWorkerClient;
@@ -505,7 +541,7 @@ export async function synthesizeSpeech(requestBody, options = {}) {
       throw normalizeAbortReason(signal.reason);
     }
 
-    const synthesis = await waitForAbortable(workerClient.synthesize(text), signal);
+    const synthesis = await waitForAbortable(workerClient.synthesize(request), signal);
     const audioPath = ensureNonEmptyString(synthesis.audio_path, 'audio_path');
     const fileStats = await stat(audioPath);
     const audioSize = Number.isFinite(synthesis.audio_size)
