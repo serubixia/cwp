@@ -38,7 +38,7 @@ ENV PYTHON_EXECUTABLE=/opt/coqui-venv/bin/python
 
 EXPOSE 3000
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
     CMD ["node", "src/healthcheck.mjs"]
 
 CMD ["npm", "start"]
