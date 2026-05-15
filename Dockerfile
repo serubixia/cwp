@@ -18,6 +18,7 @@ RUN apt-get update \
         python3-pip \
         python3-venv \
         espeak-ng \
+        ffmpeg \
         libsndfile1 \
     && rm -rf /var/lib/apt/lists/*
 
