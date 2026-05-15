@@ -295,6 +295,17 @@ export function resolveWorkerRuntimeConfig(options = {}) {
   };
 }
 
+function buildWorkerCacheKey(runtimeConfig) {
+  return JSON.stringify({
+    python_executable: runtimeConfig.python_executable,
+    worker_script: runtimeConfig.worker_script,
+    model: runtimeConfig.ready_state.model,
+    language: runtimeConfig.ready_state.language,
+    device: runtimeConfig.ready_state.device,
+    speaker_wav: runtimeConfig.ready_state.speaker_wav ?? null,
+  });
+}
+
 export function normalizeSynthesizeRequest(requestBody, { textLimit = DEFAULT_MAX_TEXT_LENGTH } = {}) {
   if (!requestBody || typeof requestBody !== 'object') {
     throw new Error('The request body must be an object.');
@@ -313,12 +324,20 @@ export function normalizeSynthesizeRequest(requestBody, { textLimit = DEFAULT_MA
 }
 
 function createWorkerClient(options = {}) {
-  const runtimeConfig = resolveWorkerRuntimeConfig(options);
+  const runtimeConfig = options.runtimeConfig || resolveWorkerRuntimeConfig(options);
+  let onTerminated = typeof options.onTerminated === 'function'
+    ? options.onTerminated
+    : undefined;
   const worker = spawn(runtimeConfig.python_executable, [runtimeConfig.worker_script], {
     cwd: path.resolve(runtimeConfig.src_dir, '..'),
     env: runtimeConfig.worker_env,
     stdio: ['pipe', 'pipe', 'pipe'],
   });
+
+  const markTerminated = () => {
+    onTerminated?.();
+    onTerminated = undefined;
+  };
 
   logInfo('worker.process.started', {
     python_executable: runtimeConfig.python_executable,
@@ -354,6 +373,7 @@ function createWorkerClient(options = {}) {
       worker_script: runtimeConfig.worker_script,
     });
     failPending(error);
+    markTerminated();
   });
 
   worker.on('exit', (code, signal) => {
@@ -362,6 +382,8 @@ function createWorkerClient(options = {}) {
       signal: signal ?? undefined,
       ready: isReady,
     });
+
+    markTerminated();
 
     if (pendingRequests.size === 0 && isReady && code === 0 && signal == null) {
       return;
@@ -463,6 +485,7 @@ function createWorkerClient(options = {}) {
       outputReader.close();
 
       if (worker.exitCode !== null || worker.signalCode !== null) {
+        markTerminated();
         return;
       }
 
@@ -486,6 +509,54 @@ function createWorkerClient(options = {}) {
       });
     },
   };
+}
+
+export function createSharedWorkerClientCache(createClient = createWorkerClient) {
+  const workerClients = new Map();
+
+  return {
+    get(options = {}) {
+      const runtimeConfig = options.runtimeConfig || resolveWorkerRuntimeConfig(options);
+      const cacheKey = buildWorkerCacheKey(runtimeConfig);
+      const existingClient = workerClients.get(cacheKey);
+
+      if (existingClient) {
+        return existingClient;
+      }
+
+      let workerClient;
+      workerClient = createClient({
+        ...options,
+        runtimeConfig,
+        onTerminated: () => {
+          if (workerClients.get(cacheKey) === workerClient) {
+            workerClients.delete(cacheKey);
+          }
+        },
+      });
+      workerClients.set(cacheKey, workerClient);
+      return workerClient;
+    },
+    async closeAll() {
+      const cachedClients = [...new Set(workerClients.values())];
+      workerClients.clear();
+      await Promise.allSettled(cachedClients.map((workerClient) => workerClient.close()));
+    },
+  };
+}
+
+export const defaultSharedWorkerClientCache = createSharedWorkerClientCache();
+
+export async function warmSharedWorker(options = {}) {
+  const sharedWorkerClientCache = options.sharedWorkerClientCache || defaultSharedWorkerClientCache;
+  const workerClient = sharedWorkerClientCache.get(options);
+  await waitForAbortable(workerClient.ready, options.signal);
+  return workerClient;
+}
+
+export async function closeSharedWorkers(options = {}) {
+  const sharedWorkerClientCache = options.sharedWorkerClientCache || defaultSharedWorkerClientCache;
+  await sharedWorkerClientCache.closeAll();
 }
 
 export async function getHealthStatus(options = {}) {
@@ -531,8 +602,11 @@ export async function synthesizeSpeech(requestBody, options = {}) {
     speaker_wav_override: Object.hasOwn(request, 'speaker_wav'),
   });
 
-  const workerClientFactory = options.workerClientFactory || createWorkerClient;
-  const workerClient = workerClientFactory(options);
+  const usesSharedWorker = options.workerClientFactory == null;
+  const workerClient = usesSharedWorker
+    ? (options.sharedWorkerClientCache || defaultSharedWorkerClientCache).get(options)
+    : options.workerClientFactory(options);
+  let shouldCloseWorker = !usesSharedWorker;
 
   try {
     const readyState = await waitForAbortable(workerClient.ready, signal);
@@ -588,6 +662,8 @@ export async function synthesizeSpeech(requestBody, options = {}) {
 
     throw error;
   } finally {
-    await workerClient.close().catch(() => {});
+    if (shouldCloseWorker) {
+      await workerClient.close().catch(() => {});
+    }
   }
 }
